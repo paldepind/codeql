@@ -108,6 +108,32 @@ private module Input2 implements InputSig2 {
   class TypeMention = TM::TypeMention;
 
   TypeMention getABaseTypeMention(Type t) { result = t.getABaseTypeMention() }
+
+  predicate typeSatisfiesConstraint(TypeMention sub, TypeMention sup) {
+    // `impl` blocks implementing traits
+    exists(Impl impl |
+      sub = impl.getSelfTy() and
+      sup = impl.getTrait()
+    )
+    or
+    // supertraits
+    exists(Trait trait |
+      sub = trait and
+      sup = trait.getTypeBoundList().getABound().getTypeRepr()
+    )
+    or
+    // trait bounds
+    exists(TypeParam param |
+      sub = param and
+      sup = param.getTypeBoundList().getABound().getTypeRepr()
+    )
+    or
+    // the implicit `Self` type parameter satisfies the trait
+    exists(SelfTypeParameterMention self |
+      sub = self and
+      sup = self.getTrait()
+    )
+  }
 }
 
 private module M2 = Make2<Input2>;
@@ -140,6 +166,36 @@ private TypeMention getTypeAnnotation(AstNode n) {
 pragma[nomagic]
 private Type inferAnnotatedType(AstNode n, TypePath path) {
   result = getTypeAnnotation(n).resolveTypeAt(path)
+}
+
+/** Step three */
+// pragma[nomagic]
+bindingset[path1]
+bindingset[path2]
+predicate recordExprFieldTypeEquality(StructExpr re, TypePath path1, Expr n2, TypePath path2) {
+  exists(Struct s, string field, TypeParameter tp |
+    re.getFieldExpr(field).getExpr() = n2 and
+    s = resolvePath(re.getPath()) and
+    // FIXME: Only handles simple case where the field type is directly a
+    // type param and not nested cases
+    Experiment::correspondsToArg(s, field, tp) and
+    path1 = TypePath::cons(tp, path2)
+  )
+}
+
+/** Field: Step one */
+bindingset[path1]
+bindingset[path2]
+predicate fieldExprTypeEquality(FieldExpr e, TypePath path1, Expr n2, TypePath path2) {
+  n2 = e.getContainer() and
+  exists(Struct s, string field, TypeParameter tp |
+    field = e.getIdentifier().getText() and
+    inferType(n2, TypePath::nil()) = TStruct(s) and
+    // FIXME: Only handles simple case where the field type is directly a
+    // type param and not nested cases
+    Experiment::correspondsToArg(s, field, tp) and
+    path2 = TypePath::cons(tp, path1)
+  )
 }
 
 /**
@@ -189,6 +245,10 @@ private predicate typeEquality(AstNode n1, TypePath path1, AstNode n2, TypePath 
     break.getTarget() = n2.(LoopExpr) and
     path1 = path2
   )
+  // or
+  // recordExprFieldTypeEquality(n1, path1, n2, path2)
+  // or
+  // fieldExprTypeEquality(n1, path1, n2, path2)
 }
 
 pragma[nomagic]
@@ -226,7 +286,7 @@ private Type getRefAdjustImplicitSelfType(SelfParam self, TypePath suffix, Type 
 }
 
 pragma[nomagic]
-private Type inferImplSelfType(Impl i, TypePath path) {
+private Type resolveImplSelfType(Impl i, TypePath path) {
   result = i.getSelfTy().(TypeReprMention).resolveTypeAt(path)
 }
 
@@ -238,7 +298,7 @@ private Type inferImplicitSelfType(SelfParam self, TypePath path) {
     self = f.getParamList().getSelfParam() and
     result = getRefAdjustImplicitSelfType(self, suffix, t, path)
   |
-    t = inferImplSelfType(i, suffix)
+    t = resolveImplSelfType(i, suffix)
     or
     t = TSelfTypeParameter(i) and suffix.isEmpty()
   )
@@ -737,7 +797,7 @@ private module FieldExprMatchingInput implements MatchingInputSig {
   }
 
   abstract class Declaration extends AstNode {
-    TypeParameter getTypeParameter(TypeParameterPosition ppos) { none() }
+    abstract TypeParameter getTypeParameter(TypeParameterPosition ppos);
 
     abstract TypeRepr getTypeRepr();
 
@@ -758,10 +818,24 @@ private module FieldExprMatchingInput implements MatchingInputSig {
   }
 
   private class StructFieldDecl extends Declaration instanceof StructField {
+    override TypeParameter getTypeParameter(TypeParameterPosition ppos) {
+      none()
+      // typeParamMatchPosition(any(Struct s | s.getStructField(_) = this)
+      //       .getGenericParamList()
+      //       .getATypeParam(), result, ppos)
+    }
+
     override TypeRepr getTypeRepr() { result = StructField.super.getTypeRepr() }
   }
 
   private class TupleFieldDecl extends Declaration instanceof TupleField {
+    override TypeParameter getTypeParameter(TypeParameterPosition ppos) {
+      none()
+      // typeParamMatchPosition(any(Struct s | s.getTupleField(_) = this)
+      //       .getGenericParamList()
+      //       .getATypeParam(), result, ppos)
+    }
+
     override TypeRepr getTypeRepr() { result = TupleField.super.getTypeRepr() }
   }
 
@@ -891,39 +965,75 @@ private Type inferRefExprType(Expr e, TypePath path) {
   )
 }
 
+bindingset[typeMention]
+predicate getMatchingImpl(TypeMention typeMention, Impl impl) {
+  resolveImplSelfType(impl, TypePath::nil()) = typeMention.resolveTypeAt(TypePath::nil()) and
+  forall(TypePath path, Type type | type = resolveImplSelfType(impl, path) |
+    typeMention.resolveTypeAt(path) = type
+  )
+}
+
 cached
 private module Cached {
   private import codeql.rust.internal.CachedStages
 
   pragma[inline]
-  private Type getLookupType(AstNode n) {
+  private Type inferTypeDeref(AstNode n, TypePath path) {
     exists(Type t |
       t = inferType(n) and
       if t = TRefType()
       then
         // for reference types, lookup members in the type being referenced
-        result = inferType(n, TypePath::singleton(TRefTypeParameter()))
-      else result = t
+        result = inferType(n, TypePath::cons(TRefTypeParameter(), path))
+      else result = inferType(n, path)
     )
   }
 
-  pragma[nomagic]
-  private Type getMethodCallExprLookupType(MethodCallExpr mce, string name) {
-    result = getLookupType(mce.getReceiver()) and
-    name = mce.getIdentifier().getText()
+  /**
+   * Gets an `impl` block with an implementing type that matches the type of
+   * `mce`'s receiver.
+   */
+  private predicate methodCallMatchingImpl(Expr receiver, string name, Function function) {
+    exists(Impl impl |
+      // The `impl` block matches the receiver at the root
+      resolveImplSelfType(impl, TypePath::nil()) = inferTypeDeref(receiver, TypePath::nil()) and
+      function = impl.(ImplItemNode).getASuccessor(name) and
+      forall(TypePath path, Type type | type = resolveImplSelfType(impl, path) |
+        // NOTE: Simply ignoring type parameters is too loose. If the same tp
+        // occurs several times those occurences must be equal.
+        if type = TTypeParamTypeParameter(impl.getGenericParamList().getTypeParam(_))
+        then any()
+        else inferTypeDeref(receiver, path) = type
+      )
+    )
   }
 
+  // private predicate methodCallFromTraitBound(Expr receiver, string name, Function function) {
+  //   exists(TypeParameter rootType |
+  //     rootType = inferTypeDeref(receiver, TypePath::nil()) and
+  //     rootType.getMethod(name) = function
+  //   )
+  // }
   /**
    * Gets a method that the method call `mce` resolves to, if any.
    */
   cached
   Function resolveMethodCallExpr(MethodCallExpr mce) {
-    exists(string name | result = getMethodCallExprLookupType(mce, name).getMethod(name))
+    exists(Expr receiver, string name, Type rootType |
+      mce.getReceiver() = receiver and
+      mce.getIdentifier().getText() = name and
+      rootType = inferTypeDeref(receiver, TypePath::nil())
+    |
+      not rootType instanceof TypeParameter and
+      methodCallMatchingImpl(receiver, name, result)
+      or
+      rootType.(TypeParameter).getMethod(name) = result
+    )
   }
 
   pragma[nomagic]
   private Type getFieldExprLookupType(FieldExpr fe, string name) {
-    result = getLookupType(fe.getContainer()) and
+    result = inferTypeDeref(fe.getContainer(), TypePath::nil()) and
     name = fe.getIdentifier().getText()
   }
 
@@ -941,6 +1051,150 @@ private module Cached {
       result = getFieldExprLookupType(fe, name) and
       pos = name.toInt()
     )
+  }
+
+  cached
+  module Experiment {
+    // Type typeSubst(AstNode n, StructType type, TypePath path) {
+    //   // The type of the node is an instantiation of `type`
+    //   inferType(n, TypePath::nil()) = type and
+    //   // This should be a bit like what's going on inside `inferAccessType`
+    //   exists(TypeParameter tp |
+    //     tp = type.getATypeParameter() and
+    //     inferType()
+    //   )
+    // }
+    /**
+     * Gets the type of the type application `app` of `abs`.
+     *
+     * Type application is esentially substitution. All the type parameters of `abs`
+     * are substituted with the respective type for that parameter in `app`.
+     */
+    cached
+    Type typeApplication(StructType abs, StructExpr app, TypePath path) {
+      resolvePath(app.getPath()) = abs.asItemNode() and
+      (
+        path.isEmpty() and
+        result = abs
+        or
+        exists(TypeParameter tp, TypeMention men, TypePath suffix |
+          tp = abs.getATypeParameter() and
+          men = getExplicitTypeArgMention(app.getPath(), tp.(TypeParamTypeParameter).getTypeParam()) and
+          path = TypePath::singleton(tp).append(suffix) and
+          result = men.resolveTypeAt(suffix)
+        )
+      )
+    }
+
+    /**
+     * Hold if type of the struct type `t` at the field `field` corresponds to
+     * type parameter `pt` of `t`.
+     */
+    cached
+    predicate correspondsToArg(Struct t, string field, TypeParameter tp) {
+      tp = t.getStructField(field).getTypeRepr().(TypeReprMention).resolveType()
+    }
+
+    /** Step one */
+    pragma[nomagic]
+    cached
+    Type inferRecordExprTypeStep1(StructExpr re, TypePath path) {
+      path.isEmpty() and
+      exists(Struct s | s = resolvePath(re.getPath()) | result = TStruct(s))
+    }
+
+    /** Step two */
+    pragma[nomagic]
+    cached
+    Type inferRecordExprTypeParameter(StructExpr re, TypePath path) {
+      exists(TypeParameter tp, TypeMention men, TypePath suffix |
+        // tp = abs.getATypeParameter() and
+        men = getExplicitTypeArgMention(re.getPath(), tp.(TypeParamTypeParameter).getTypeParam()) and
+        path = TypePath::singleton(tp).append(suffix) and
+        result = men.resolveTypeAt(suffix)
+      )
+    }
+
+    cached
+    Type propagateTypeDeclaration(TypeRepr r, TypePath path) {
+      result = r.(TypeReprMention).resolveTypeAt(path) and
+      not result instanceof TypeParameter
+    }
+
+    /** Step four, declaration propagation. */
+    pragma[nomagic]
+    cached
+    Type inferStructFieldExprFromDeclaration(Expr e, TypePath path) {
+      exists(StructExpr record, Struct s, string field |
+        s = resolvePath(record.getPath()) and
+        e = record.getFieldExpr(field).getExpr() and
+        result = propagateTypeDeclaration(s.getStructField(field).getTypeRepr(), path)
+      )
+    }
+
+    /** Field: Step two, declaration propagation. */
+    pragma[nomagic]
+    cached
+    Type inferFieldExprFromDeclaration(FieldExpr e, TypePath path) {
+      exists(Struct s |
+        inferType(e.getContainer(), TypePath::nil()) = TStruct(s) and
+        result =
+          propagateTypeDeclaration(s.getStructField(e.getIdentifier().getText()).getTypeRepr(), path)
+      )
+    }
+
+    pragma[nomagic]
+    cached
+    Type inferRecordExprType(StructExpr re, TypePath path) {
+      exists(Struct s | s = resolvePath(re.getPath()) |
+        result = typeApplication(TStruct(s), re, path)
+        or
+        // Type information flows from the type of the fields into type arguments
+        exists(string field, TypeParameter tp, TypePath fieldPath |
+          correspondsToArg(s, field, tp) and
+          result = inferType(re.getFieldExpr(field).getExpr(), fieldPath) and
+          path = TypePath::cons(tp, fieldPath)
+        )
+      )
+    }
+
+    pragma[nomagic]
+    cached
+    Type fieldExprType(FieldExpr fe, TypePath path) {
+      // exists(StructType ty |
+      //   ty = inferType(fe.getExpr()) and ty.getStructField(fe.getNameRef().getText())
+      // )
+      exists(StructField field |
+        field = resolveStructFieldExpr(fe) and
+        result = field.getTypeRepr().(TypeReprMention).resolveTypeAt(path)
+      )
+      // exists(StructField f |
+      // resolveStructFieldExpr(fe) = f and
+      // result = f.getTypeRepr().(TypeReprMention).resolveTypeAt(path)
+      // )
+    }
+
+    /**
+     * The type `sub` "extends" the type `sup` and has the resulting type at
+     * the path `path`.
+     */
+    cached
+    Type satisfiesType(Type sub, Type sup, TypePath path) { none() }
+
+    cached
+    abstract class TypeAbs extends Type {
+      /** Gets a type parameter of this type, if any. */
+      cached
+      abstract TypeParameter getATypeParameter();
+    }
+
+    // bindingset[abs, path, t, path2, t2]
+    cached
+    predicate substitution(
+      TypeAbs abs, TypePath path, Type t, TypePath path2, Type t2, TypePath resultPath, Type t3
+    ) {
+      none()
+    }
   }
 
   /**
@@ -999,15 +1253,23 @@ private module Cached {
     or
     result = inferImplicitSelfType(n, path)
     or
-    result = inferStructExprType(n, path)
-    or
     result = inferPathExprType(n, path)
     or
     result = inferCallExprBaseType(n, path)
     or
-    result = inferFieldExprType(n, path)
-    or
     result = inferRefExprType(n, path)
+    or
+    result = inferStructExprType(n, path)
+    or
+    result = inferFieldExprType(n, path)
+    // or
+    // result = Experiment::inferRecordExprTypeStep1(n, path)
+    // or
+    // result = Experiment::inferRecordExprTypeParameter(n, path)
+    // or
+    // result = Experiment::inferStructFieldExprFromDeclaration(n, path)
+    // or
+    // result = Experiment::inferFieldExprFromDeclaration(n, path)
   }
 }
 

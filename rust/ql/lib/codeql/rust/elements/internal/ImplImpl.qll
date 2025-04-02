@@ -5,6 +5,7 @@
  */
 
 private import codeql.rust.elements.internal.generated.Impl
+private import codeql.rust.elements.Function
 
 /**
  * INTERNAL: This module contains the customizable definition of `Impl` and should not
@@ -29,5 +30,14 @@ module Impl {
         result = "impl " + trait + this.getSelfTy().toAbbreviatedString() + " { ... }"
       )
     }
+
+    /** Gets the method with name `name` in this impl block, if any. */
+    Function getMethod(string name) {
+      result = this.getAssocItemList().getAnAssocItem() and
+      result.getName().getText() = name and
+      result.getParamList().hasSelfParam()
+    }
+
+    predicate hasMethod(string name) { exists(this.getMethod(name)) }
   }
 }
